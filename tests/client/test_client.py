@@ -1,6 +1,10 @@
 """Tests for the client library."""
 
+import logging
+import os
+import stat
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -8,7 +12,7 @@ from aiohttp import web
 from pytest_aiohttp import AiohttpClient
 
 from supernote.client import Client
-from supernote.client.auth import AbstractAuth, ConstantAuth
+from supernote.client.auth import AbstractAuth, ConstantAuth, FileCacheAuth
 from supernote.client.exceptions import (
     ApiException,
     ForbiddenException,
@@ -226,3 +230,124 @@ async def test_auth_token_missing(aiohttp_client: AiohttpClient) -> None:
     assert response.success
     headers = response.data
     assert "x-access-token" not in headers
+
+
+async def test_api_key_sends_authorization_bearer_header(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Test that static sn_... API keys send Authorization: Bearer rather than x-access-token."""
+
+    @dataclass
+    class HeadersResponse(BaseResponse):
+        data: dict[str, str] = field(default_factory=dict)
+
+    async def handler_headers(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "success": True,
+                "data": dict(request.headers),
+            }
+        )
+
+    async def handler_csrf(request: web.Request) -> web.Response:
+        return web.Response(text="ok", headers={"X-XSRF-TOKEN": "test-token"})
+
+    app = web.Application()
+    app.router.add_get("/api/csrf", handler_csrf)
+    app.router.add_get("/headers", handler_headers)
+
+    test_client = await aiohttp_client(app)
+    base_url = str(test_client.make_url(""))
+
+    api_key = "sn_0123456789abcdef0123456789abcdef"
+    client = Client(
+        test_client.session,
+        host=base_url,
+        auth=ConstantAuth(api_key),
+    )
+
+    response = await client.get_json("headers", HeadersResponse)
+    assert response.success
+    headers = response.data
+    assert headers.get("Authorization") == f"Bearer {api_key}"
+    assert "x-access-token" not in headers
+
+
+async def test_cross_origin_requests_strip_credentials_and_csrf(
+    aiohttp_client: AiohttpClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify Client never sends Bearer/x-access-token/XSRF headers to cross-origin OSS URLs or debug logs."""
+
+    @dataclass
+    class HeadersResponse(BaseResponse):
+        data: dict[str, str] = field(default_factory=dict)
+        key: str = ""
+
+    api_key = "sn_fedcba9876543210fedcba9876543210"
+
+    async def handler_csrf(_request: web.Request) -> web.Response:
+        return web.Response(text="ok", headers={"X-XSRF-TOKEN": "csrf-tok"})
+
+    async def handler_same_origin(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "success": True,
+                "data": dict(request.headers),
+                "key": api_key,
+            }
+        )
+
+    async def handler_external_oss(request: web.Request) -> web.Response:
+        return web.json_response({"success": True, "data": dict(request.headers)})
+
+    api_app = web.Application()
+    api_app.router.add_get("/api/csrf", handler_csrf)
+    api_app.router.add_get("/headers", handler_same_origin)
+
+    oss_app = web.Application()
+    oss_app.router.add_get("/presigned-blob", handler_external_oss)
+
+    api_server = await aiohttp_client(api_app)
+    oss_server = await aiohttp_client(oss_app)
+    api_base = str(api_server.make_url(""))
+    oss_url = str(oss_server.make_url("/presigned-blob?X-Amz-Signature=sig"))
+
+    client = Client(
+        api_server.session,
+        host=api_base,
+        auth=ConstantAuth(api_key),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="supernote.client.client"):
+        # Full same-origin URL receives Authorization + X-XSRF-TOKEN, but debug logs redact raw key
+        same_resp = await client.get_json(f"{api_base}/headers", HeadersResponse)
+        assert same_resp.data.get("Authorization") == f"Bearer {api_key}"
+        assert same_resp.data.get("X-XSRF-TOKEN") == "csrf-tok"
+        assert api_key not in caplog.text
+
+        # Cross-origin presigned OSS URL must NOT receive Authorization, x-access-token, X-XSRF-TOKEN, or Origin
+        cross_resp = await client.get_json(oss_url, HeadersResponse)
+        assert "Authorization" not in cross_resp.data
+        assert "x-access-token" not in cross_resp.data
+        assert "X-XSRF-TOKEN" not in cross_resp.data
+        assert "Origin" not in cross_resp.data
+        assert "Referer" not in cross_resp.data
+
+
+def test_file_cache_auth_enforces_0600_permissions(tmp_path: Path) -> None:
+    """Verify FileCacheAuth writes credential cache files with strict 0600 owner-only permissions."""
+    cache_file = tmp_path / "nested" / "supernote.pkl"
+    # Even if a world-readable file pre-exists, save_credentials tightens permissions to 0600
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_bytes(b"stale")
+    os.chmod(cache_file, 0o644)
+
+    auth = FileCacheAuth(str(cache_file))
+    auth.save_credentials("tok_secret", "http://localhost:8080")
+
+    mode = stat.S_IMODE(cache_file.stat().st_mode)
+    assert mode == 0o600
+    reloaded = FileCacheAuth(str(cache_file))
+    assert reloaded.token == "tok_secret"
+    assert reloaded.get_host() == "http://localhost:8080"
