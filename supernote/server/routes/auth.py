@@ -44,7 +44,7 @@ from supernote.server.utils.rate_limit import (
     RateLimitExceeded,
 )
 
-from .decorators import public_route
+from .decorators import interactive_session_only, public_route
 
 routes = web.RouteTableDef()
 
@@ -374,6 +374,7 @@ async def handle_register(request: web.Request) -> web.Response:
 
 
 @routes.post("/api/user/account/clear")
+@interactive_session_only
 async def handle_account_clear(request: web.Request) -> web.Response:
     """Permanently delete the authenticated user account and all cloud content.
 
@@ -401,6 +402,7 @@ async def handle_account_clear(request: web.Request) -> web.Response:
 
 
 @routes.post("/api/user/logout")
+@interactive_session_only
 async def handle_logout(request: web.Request) -> web.Response:
     """Log out the current session and revoke its token."""
     token = get_token_from_request(request)
@@ -415,6 +417,7 @@ async def handle_logout(request: web.Request) -> web.Response:
 
 
 @routes.put("/api/user/password")
+@interactive_session_only
 async def handle_update_password(request: web.Request) -> web.Response:
     """Update user password."""
     account = request.get("user")
@@ -434,6 +437,7 @@ async def handle_update_password(request: web.Request) -> web.Response:
 
 
 @routes.put("/api/user/email")
+@interactive_session_only
 async def handle_update_email(request: web.Request) -> web.Response:
     """Update user email."""
     account = request.get("user")
@@ -511,6 +515,7 @@ async def handle_retrieve_password(request: web.Request) -> web.Response:
 # TODO: Also implement sensitive query operations and record them for all operations
 # done on the user (update, edit settings, reset passwd, etc)
 @routes.post("/api/user/query/loginRecord")
+@interactive_session_only
 async def handle_login_record(request: web.Request) -> web.Response:
     """Query login records."""
     account = request.get("user")

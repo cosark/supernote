@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from functools import wraps
 
 from aiohttp import web
 from mashumaro.exceptions import InvalidFieldValue, MissingField
@@ -19,7 +20,9 @@ from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.events import LocalEventBus, NoteUpdatedEvent
 from supernote.server.exceptions import SupernoteError
 from supernote.server.services.integrity import IntegrityService
-from supernote.server.services.user import UserService
+from supernote.server.services.user import AuthMethod, UserService
+
+from .decorators import interactive_session_only
 
 routes = web.RouteTableDef()
 
@@ -27,9 +30,18 @@ routes = web.RouteTableDef()
 def require_admin(
     handler: Callable[[web.Request], Awaitable[web.Response]],
 ) -> Callable[[web.Request], Awaitable[web.Response]]:
-    """Decorator to require admin privileges."""
+    """Decorator to require admin privileges over an interactive session."""
 
+    @wraps(handler)
     async def wrapper(request: web.Request) -> web.Response:
+        if request.get("auth_method") == AuthMethod.API_KEY:
+            return web.json_response(
+                create_error_response(
+                    "Forbidden: Interactive session required"
+                ).to_dict(),
+                status=403,
+            )
+
         user_service: UserService = request.app["user_service"]
         username = request.get("user")
         if not username:
@@ -46,6 +58,7 @@ def require_admin(
 
         return await handler(request)
 
+    interactive_session_only(wrapper)
     return wrapper
 
 
