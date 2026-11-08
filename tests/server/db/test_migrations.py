@@ -85,7 +85,7 @@ def test_migration_upgrades_successfully(migrated_db: str) -> None:
         # Check if the 'alembic_version' table exists and has the head revision
         result = conn.execute(text("SELECT version_num FROM alembic_version"))
         version = result.scalar()
-        assert version == "d5e6f7a8b9c0"
+        assert version == "e8f9a0b1c2d3"
 
         # Check if a known table exists (e.g. users)
         result = conn.execute(text("SELECT count(*) FROM users"))
@@ -181,7 +181,7 @@ def test_orphaned_v0_20_0_migration_self_healing(tmp_path: Path) -> None:
     engine = create_engine(migration_db_url)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "d5e6f7a8b9c0"
+        assert version == "e8f9a0b1c2d3"
 
         # Verify task columns and types
         tasks = conn.execute(
@@ -807,4 +807,44 @@ def test_reset_legacy_default_user_quota_migration(
             ("custom@example.com", "53687091200"),
         ]
 
+    engine.dispose()
+
+
+def test_api_keys_table_migration(tmp_path: Path, alembic_config: Config) -> None:
+    """Verify migration e8f9a0b1c2d3 creates and drops the api_keys table cleanly."""
+    db_path = tmp_path / "api_keys_migration.db"
+    shutil.copy(Path("tests/fixtures/db_v1.sqlite").absolute(), db_path)
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_config, "e8f9a0b1c2d3")
+
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO users (id, email, password_md5, is_active, total_capacity, is_admin) "
+                "VALUES (201, 'keyowner@example.com', '098f6bcd4621d373cade4e832627b4f6', 1, '0', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO api_keys (user_id, id, name, key_prefix, sha256_hash, created_at, last_used_at, expires_at) "
+                "VALUES (201, 'key001', 'CLI', 'sn_00001111...', :digest, 1700000000, NULL, 1702592000)"
+            ),
+            {"digest": "a" * 64},
+        )
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT user_id, id, name, key_prefix, expires_at FROM api_keys WHERE id = 'key001'"
+            )
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == (201, "key001", "CLI", "sn_00001111...", 1702592000)
+
+    command.downgrade(alembic_config, "d5e6f7a8b9c0")
+    reflected = MetaData()
+    reflected.reflect(bind=engine)
+    assert "api_keys" not in reflected.tables
     engine.dispose()
